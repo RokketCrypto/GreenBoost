@@ -1205,21 +1205,41 @@ cmd_full_install() {
     chmod -R 755 /opt/greenboost
 
     # Install ExLlamaV3 from bundled library.
-    # --no-build-isolation: flash_attn's setup.py imports torch at build time;
-    #   torch is in the venv but not available in pip's isolated sandbox.
-    # PATH="$venv_dir/bin:$PATH": maturin is installed as a venv binary but pip's
-    #   build subprocess does not inherit the activated venv PATH, so maturin must
-    #   be reachable via PATH explicitly for pydantic-core's pyproject hooks.
+    # Strategy: skip ALL source compilation at install time.
+    #   - ExLlamaV3's own CUDA kernels: fail on Python 3.14 + Blackwell toolchain;
+    #     ExLlamaV3 v3 compiles them lazily via torch.utils.cpp_extension.load()
+    #     at first import — no install-time build needed.
+    #   - flash_attn: source-only on Python 3.14, takes 30+ min; ExLlamaV3 has
+    #     a fallback attention path and works without it.
+    #   - pydantic-core: Rust/PyO3 0.24 doesn't support Python 3.14; install
+    #     a newer pydantic (pre-built wheel) instead of the pinned 2.11.0.
+    #
+    # Implementation: add exllamav3 dir to site-packages via .pth file,
+    # then pip-install only deps that have binary wheels for Python 3.14.
     if [[ -d "$exllama_dir" ]]; then
         info "Installing ExLlamaV3 from $exllama_dir ..."
-        warn "This may take 10-30 min on first run (flash-attn CUDA compilation)."
-        PATH="$venv_dir/bin:$PATH" \
-            PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 \
-            STLOADER_USE_URING=1 \
-            "$venv_dir/bin/python" -m pip install -e "$exllama_dir" \
-            --no-build-isolation \
-            && info "ExLlamaV3 installed." \
-            || warn "ExLlamaV3 install failed — re-run: PATH=$venv_dir/bin:\$PATH PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 STLOADER_USE_URING=1 $venv_dir/bin/python -m pip install -e $exllama_dir --no-build-isolation"
+
+        # Resolve site-packages path
+        local site_packages
+        site_packages="$("$venv_dir/bin/python" -c \
+            'import sysconfig; print(sysconfig.get_path("purelib"))')"
+
+        # Add ExLlamaV3 source directory to Python path (no CUDA build at install)
+        echo "$exllama_dir" > "$site_packages/exllamav3.pth"
+        info "ExLlamaV3 Python path registered: $site_packages/exllamav3.pth"
+
+        # Install ExLlamaV3's pure-Python / binary-wheel dependencies.
+        # Omit flash_attn (source-only, 30+ min) and pydantic 2.11.0 (Rust build).
+        # Use pydantic>=2.11.0 without upper pin so pip finds a Python 3.14 wheel.
+        "$venv_dir/bin/python" -m pip install -q \
+            ninja "marisa-trie" "kbnf>=0.4.2" "formatron>=0.5.0" \
+            "pydantic>=2.11.0" \
+            && info "ExLlamaV3 deps installed." \
+            || warn "Some ExLlamaV3 deps failed — check above."
+
+        info "ExLlamaV3 ready. CUDA kernels compile on first use (~1-2 min)."
+        info "Optional: install flash_attn for faster attention:"
+        info "  PATH=$venv_dir/bin:\$PATH $venv_dir/bin/python -m pip install flash_attn --no-build-isolation"
     else
         warn "ExLlamaV3 not found at $exllama_dir — skipping."
     fi

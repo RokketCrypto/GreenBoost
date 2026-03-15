@@ -229,7 +229,7 @@ COMMANDS:
   install-sys-configs  Install Ollama env, NVMe udev, CPU governor, hugepages, sysctl
   install-deps         Install all Ubuntu OS packages (build + CUDA + AI libs)
   setup-swap [GB]      Create/activate NVMe swap (default: auto-sized, ~64 GB for target model)
-  full-install [--owner-workstation]  Complete install — hardware auto-detected or owner preset
+  full-install    Complete install — hardware auto-detected, .env overrides supported
   status      Show module status and 3-tier pool info
   diagnose    Full health check — run this after reboot to verify everything works
   optimize-model [--model M] [--strategy tensorrt|lora|exllama|all]

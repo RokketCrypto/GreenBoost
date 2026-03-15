@@ -23,6 +23,9 @@ nano.*.save
 .claude/
 CLAUDE.md
 
+# Local configuration
+.env
+
 # IDE config
 .continue/
 

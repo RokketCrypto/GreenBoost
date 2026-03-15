@@ -261,8 +261,10 @@ sudo ./greenboost_setup.sh optimize-model --model THUDM/glm-4.7-flash-hf \
 # Auto-detect GPU, RAM, CPU topology, NVMe:
 sudo ./greenboost_setup.sh full-install
 
-# Hardcoded optimal preset for owner's workstation:
-sudo ./greenboost_setup.sh full-install --owner-workstation
+# To override auto-detected values, create a .env file (see .env_example):
+cp .env_example .env
+nano .env
+sudo ./greenboost_setup.sh full-install
 ```
 
 **Detected parameters:**

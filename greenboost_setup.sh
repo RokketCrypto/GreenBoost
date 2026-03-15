@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 # GreenBoost v2.3 — Setup & installation script
-# Author: Ferran Duarri
-# Hardware: ASRock B760M-ITX/D4 | i9-14900KF | RTX 5070 OC | 64 GB DDR4-3600 | Samsung 990 EVO Plus 4 TB
+# Originally by Ferran Duarri, forked by RokketCrypto
 #
 # 3-tier memory hierarchy:
-#   Tier 1 — RTX 5070 VRAM      12 GB   ~336 GB/s GDDR7  (hot layers)
-#   Tier 2 — DDR4 pool          51 GB   ~57.6 GB/s dual-ch (cold layers)
-#   Tier 3 — NVMe swap          64 GB   ~7.25 GB/s seq     (frozen pages, auto-sized)
-#   Combined capacity           75 GB   (T3 expandable up to 200+ GB)
+#   Tier 1 — GPU VRAM           (auto-detected)
+#   Tier 2 — DDR pool           (auto-detected, ~80% of system RAM)
+#   Tier 3 — NVMe swap          (auto-sized, frozen pages)
 #
 # USAGE:
 #   sudo ./greenboost_setup.sh install          — build + install system-wide
@@ -25,12 +23,10 @@
 #        ./greenboost_setup.sh build            — build only (no install)
 #        ./greenboost_setup.sh help             — show this help
 #
-# ENVIRONMENT (for load command):
-#   GPU_PHYS_GB=12     physical VRAM in GB       (RTX 5070 default)
-#   VIRT_VRAM_GB=51    DDR4 pool size in GB      (80% of 64 GB DDR4)
-#   RESERVE_GB=12      minimum free system RAM to always maintain
-#   NVME_SWAP_GB=64    total NVMe swap capacity  (auto-detected; 64 GB default)
-#   NVME_POOL_GB=58    GreenBoost soft cap on T3 allocations
+# CONFIGURATION:
+#   Hardware is auto-detected. To override, create a .env file (see .env_example).
+#   Environment variables (for load command) also work:
+#   GPU_PHYS_GB, VIRT_VRAM_GB, RESERVE_GB, NVME_SWAP_GB, NVME_POOL_GB
 
 DRIVER_NAME="greenboost"
 SHIM_LIB="libgreenboost_cuda.so"
@@ -170,25 +166,31 @@ print_detected_hardware() {
     info "  CTX   : OLLAMA_NUM_CTX=${GB_OLLAMA_CTX}"
 }
 
-# Owner-workstation preset — hard-coded optimal for known hardware:
-# ASRock B760M-ITX/D4 | i9-14900KF | RTX 5070 OC 12GB | 64GB DDR4-3600 dual-ch | Samsung 990 EVO Plus 4TB
-set_owner_workstation_params() {
-    GPU_NAME="ASUS RTX 5070 OC (GB205)"
-    CPU_NAME="Intel Core i9-14900KF (8Px2HT + 16E = 32 logical, golden CPU 4-7 @ 6GHz)"
-    RAM_TYPE="DDR4"
-    RAM_SPEED_MT="3600"
-    NVME_SIZE_GB=4000
-    GB_PHYS=12
-    GB_VIRT=51
-    GB_RESERVE=12
-    GB_NVME_SWAP=64
-    GB_NVME_POOL=58
-    GB_PCORES_MAX=15
-    GB_GOLDEN_MIN=4
-    GB_GOLDEN_MAX=7
-    GB_PCORES_ONLY=1
-    GB_OLLAMA_CTX=131072
-    info "Owner-workstation preset applied (i9-14900KF | RTX 5070 12GB | 64GB DDR4-3600 | 4TB NVMe)"
+# Load .env overrides if present (sourced AFTER detect_hardware so values override auto-detection)
+load_env_file() {
+    local env_file="${MODULE_DIR}/.env"
+    if [[ -f "$env_file" ]]; then
+        info "Loading .env overrides from $env_file"
+        # Source only lines matching KEY=VALUE (ignore comments and blank lines)
+        while IFS='=' read -r key value; do
+            key=$(echo "$key" | xargs)  # trim whitespace
+            [[ -z "$key" || "$key" == \#* ]] && continue
+            value=$(echo "$value" | xargs | sed 's/^["'\''"]//;s/["'\''"]$//')  # trim + strip quotes
+            export "$key=$value"
+        done < "$env_file"
+
+        # Apply overrides to GB_* variables if set in .env
+        [[ -n "${ENV_GB_PHYS:-}" ]]         && GB_PHYS="$ENV_GB_PHYS"
+        [[ -n "${ENV_GB_VIRT:-}" ]]         && GB_VIRT="$ENV_GB_VIRT"
+        [[ -n "${ENV_GB_RESERVE:-}" ]]      && GB_RESERVE="$ENV_GB_RESERVE"
+        [[ -n "${ENV_GB_NVME_SWAP:-}" ]]    && GB_NVME_SWAP="$ENV_GB_NVME_SWAP"
+        [[ -n "${ENV_GB_NVME_POOL:-}" ]]    && GB_NVME_POOL="$ENV_GB_NVME_POOL"
+        [[ -n "${ENV_GB_PCORES_MAX:-}" ]]   && GB_PCORES_MAX="$ENV_GB_PCORES_MAX"
+        [[ -n "${ENV_GB_GOLDEN_MIN:-}" ]]   && GB_GOLDEN_MIN="$ENV_GB_GOLDEN_MIN"
+        [[ -n "${ENV_GB_GOLDEN_MAX:-}" ]]   && GB_GOLDEN_MAX="$ENV_GB_GOLDEN_MAX"
+        [[ -n "${ENV_GB_PCORES_ONLY:-}" ]]  && GB_PCORES_ONLY="$ENV_GB_PCORES_ONLY"
+        [[ -n "${ENV_GB_OLLAMA_CTX:-}" ]]   && GB_OLLAMA_CTX="$ENV_GB_OLLAMA_CTX"
+    fi
 }
 
 # ---- Helpers -----------------------------------------------------------
@@ -978,19 +980,23 @@ cmd_help() {
     echo "  install-sys-configs  Install Ollama env, NVMe udev, CPU governor, hugepages, sysctl"
     echo "  install-deps         Install all Ubuntu OS packages (build + CUDA + AI libs)"
     echo "  setup-swap [GB]      Create/activate NVMe swap (default: auto-sized, ~64 GB for target model)"
-    echo "  full-install [--owner-workstation]  Complete install — hardware auto-detected or owner preset"
+    echo "  full-install    Complete install — hardware auto-detected, .env overrides supported"
     echo "  status      Show module status and 3-tier pool info"
     echo "  diagnose    Full health check — run this after reboot to verify everything works"
     echo "  optimize-model [--model M] [--strategy tensorrt|lora|exllama|all]"
     echo "               Optimize LLM for max speed: TRT-LLM, LoRA, ExLlamaV3"
     echo "  help        Show this help"
     echo ""
-    echo "ENVIRONMENT (for load):"
-    echo "  GPU_PHYS_GB=12     Physical VRAM in GB          (RTX 5070 default: 12)"
-    echo "  VIRT_VRAM_GB=51    DDR4 pool size in GB         (default: 51, 80% of 64 GB)"
-    echo "  RESERVE_GB=12      System RAM to keep free      (default: 12)"
-    echo "  NVME_SWAP_GB=64    NVMe swap capacity in GB     (default: 64, auto-detected)"
-    echo "  NVME_POOL_GB=58    GreenBoost T3 soft cap in GB (default: 58)"
+    echo "CONFIGURATION:"
+    echo "  All parameters are auto-detected. To override, create a .env file"
+    echo "  in the project directory (see .env_example for all options)."
+    echo ""
+    echo "ENVIRONMENT (for load command):"
+    echo "  GPU_PHYS_GB        Physical VRAM in GB          (auto-detected)"
+    echo "  VIRT_VRAM_GB       DDR pool size in GB          (auto-detected)"
+    echo "  RESERVE_GB         System RAM to keep free      (auto-detected)"
+    echo "  NVME_SWAP_GB       NVMe swap capacity in GB     (auto-detected)"
+    echo "  NVME_POOL_GB       GreenBoost T3 soft cap in GB (auto-detected)"
     echo ""
     echo "  Example: sudo VIRT_VRAM_GB=48 NVME_SWAP_GB=64 ./greenboost_setup.sh load"
     echo ""
@@ -1124,25 +1130,13 @@ cmd_setup_swap() {
 cmd_full_install() {
     need_root full-install
 
-    # ── Hardware preset: --owner-workstation overrides auto-detection ────
-    local _owner_ws=0
-    for arg in "$@"; do
-        [[ "$arg" == "--owner-workstation" ]] && _owner_ws=1
-    done
-
-    if [[ $_owner_ws -eq 1 ]]; then
-        set_owner_workstation_params
-        info "╔══════════════════════════════════════════════════════════════╗"
-        info "║  GreenBoost — Owner-Workstation Install                     ║"
-        info "║  i9-14900KF | RTX 5070 OC | 64 GB DDR4-3600 | 4 TB NVMe   ║"
-        info "╚══════════════════════════════════════════════════════════════╝"
-    else
-        detect_hardware
-        info "╔══════════════════════════════════════════════════════════════╗"
-        info "║  GreenBoost — Dynamic Install (hardware auto-detected)      ║"
-        info "╚══════════════════════════════════════════════════════════════╝"
-        print_detected_hardware
-    fi
+    # ── Hardware detection + .env overrides ────
+    detect_hardware
+    load_env_file
+    info "╔══════════════════════════════════════════════════════════════╗"
+    info "║  GreenBoost — Full Install (hardware auto-detected)         ║"
+    info "╚══════════════════════════════════════════════════════════════╝"
+    print_detected_hardware
     echo ""
 
     # 1/7 — OS dependencies

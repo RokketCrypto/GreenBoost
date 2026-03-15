@@ -138,6 +138,9 @@ static void enqueue_prefetch(void *mapped_ptr, size_t size) {
     pthread_mutex_unlock(&prefetch_mutex);
 }
 
+/* Hash table entry states: ptr==0 → empty, ptr==HT_TOMBSTONE → deleted */
+#define HT_TOMBSTONE ((CUdeviceptr)1)
+
 typedef struct {
     CUdeviceptr           ptr;          /* 8 B  — 0 = empty slot         */
     size_t                size;         /* 8 B                            */
@@ -172,7 +175,7 @@ static int ht_insert(CUdeviceptr ptr, size_t size, int is_managed,
         gb_ht_entry_t *e = &gb_htable[(h + i) & HT_MASK];
         pthread_mutex_t *lk = ht_lock((h + i) & HT_MASK);
         pthread_mutex_lock(lk);
-        if (e->ptr == 0) {
+        if (e->ptr == 0 || e->ptr == HT_TOMBSTONE) {
             e->ptr        = ptr;
             e->size       = size;
             e->is_managed = is_managed;
@@ -202,7 +205,12 @@ static int ht_remove(CUdeviceptr ptr, size_t *out_size, int *out_managed,
             if (out_managed)    *out_managed    = e->is_managed;
             if (out_mapped_ptr) *out_mapped_ptr = e->mapped_ptr;
             if (out_fd)         *out_fd         = e->fd;
-            memset(e, 0, sizeof(*e));
+            e->ptr = HT_TOMBSTONE;
+            e->size = 0;
+            e->is_managed = 0;
+            e->gb_buf_id = 0;
+            e->mapped_ptr = NULL;
+            e->fd = 0;
             pthread_mutex_unlock(lk);
             return 1;
         }

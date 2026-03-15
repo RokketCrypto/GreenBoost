@@ -622,10 +622,23 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (IS_ERR(dmabuf)) {
 			/* gb_release won't be called — undo manually */
 			atomic_dec(&gb_dev.active_bufs);
-			atomic64_sub(buf->size, &gb_dev.pool_allocated);
-			for (j = 0; j < buf->npages; j++)
-				__free_page(buf->pages[j]);
-			kvfree(buf->pages);
+			if (buf->tier == GB_TIER3_NVME)
+				atomic64_sub(buf->size, &gb_dev.nvme_allocated);
+			else
+				atomic64_sub(buf->size, &gb_dev.pool_allocated);
+			spin_lock(&gb_dev.lru_lock);
+			list_del_init(&buf->lru_node);
+			spin_unlock(&gb_dev.lru_lock);
+			if (buf->hugepages) {
+				for (j = 0; j < buf->nhpages; j++)
+					__free_pages(buf->hpages[j],
+						     GB_HPAGE_ORDER);
+				kvfree(buf->hpages);
+			} else {
+				for (j = 0; j < buf->npages; j++)
+					__free_page(buf->pages[j]);
+				kvfree(buf->pages);
+			}
 			kfree(buf);
 			return PTR_ERR(dmabuf);
 		}
@@ -694,6 +707,9 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (IS_ERR(dmabuf)) {
 			atomic_dec(&gb_dev.active_bufs);
 			atomic64_sub(buf->size, &gb_dev.pool_allocated);
+			spin_lock(&gb_dev.lru_lock);
+			list_del_init(&buf->lru_node);
+			spin_unlock(&gb_dev.lru_lock);
 			for (j = 0; j < buf->npages; j++)
 				unpin_user_page(buf->pages[j]);
 			kvfree(buf->pages);
@@ -796,9 +812,10 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 		mutex_lock(&gb_dev.lock);
 		buf = idr_find(&gb_dev.idr, req.buf_id);
-		mutex_unlock(&gb_dev.lock);
-		if (!buf)
+		if (!buf) {
+			mutex_unlock(&gb_dev.lock);
 			return -ENOENT;
+		}
 
 		spin_lock(&gb_dev.lru_lock);
 		switch (req.advise) {
@@ -814,9 +831,11 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			break;
 		default:
 			spin_unlock(&gb_dev.lru_lock);
+			mutex_unlock(&gb_dev.lock);
 			return -EINVAL;
 		}
 		spin_unlock(&gb_dev.lru_lock);
+		mutex_unlock(&gb_dev.lock);
 		gb_dbg("madvise buf id=%d advise=%u\n", req.buf_id, req.advise);
 		return 0;
 	}
@@ -830,9 +849,10 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 		mutex_lock(&gb_dev.lock);
 		buf = idr_find(&gb_dev.idr, req.buf_id);
-		mutex_unlock(&gb_dev.lock);
-		if (!buf)
+		if (!buf) {
+			mutex_unlock(&gb_dev.lock);
 			return -ENOENT;
+		}
 
 		/* Move T2 accounting to T3 (kernel reclaim handles actual page-out
 		 * for GFP_HIGHUSER 4K pages; hugepage T2 buffers get soft-evicted) */
@@ -847,6 +867,7 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			gb_dbg("evict buf id=%d: T2→T3 (%zuMB)\n",
 			       buf->id, buf->size >> 20);
 		}
+		mutex_unlock(&gb_dev.lock);
 		return 0;
 	}
 

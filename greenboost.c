@@ -688,8 +688,7 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
 			return -EFAULT;
 
-		if (!req.size || !req.vaddr ||
-		    req.size > (u64)virtual_vram_gb * (1ULL << 30))
+		if (!req.size || !req.vaddr)
 			return -EINVAL;
 
 		/* 1. Pin user memory */

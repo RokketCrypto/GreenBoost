@@ -453,8 +453,12 @@ static void gb_shim_init(void)
     real_cuDeviceTotalMem_v2 = (pfn_cuDeviceTotalMem_v2) dlsym(libcuda, "cuDeviceTotalMem_v2");
     if (!real_cuDeviceTotalMem_v2)
         real_cuDeviceTotalMem_v2 = (pfn_cuDeviceTotalMem_v2) dlsym(libcuda, "cuDeviceTotalMem");
-    real_cuMemHostRegister = (pfn_cuMemHostRegister) dlsym(libcuda, "cuMemHostRegister");
-    real_cuMemHostGetDevicePointer = (pfn_cuMemHostGetDevicePointer) dlsym(libcuda, "cuMemHostGetDevicePointer");
+    real_cuMemHostRegister = (pfn_cuMemHostRegister) dlsym(libcuda, "cuMemHostRegister_v2");
+    if (!real_cuMemHostRegister)
+        real_cuMemHostRegister = (pfn_cuMemHostRegister) dlsym(libcuda, "cuMemHostRegister");
+    real_cuMemHostGetDevicePointer = (pfn_cuMemHostGetDevicePointer) dlsym(libcuda, "cuMemHostGetDevicePointer_v2");
+    if (!real_cuMemHostGetDevicePointer)
+        real_cuMemHostGetDevicePointer = (pfn_cuMemHostGetDevicePointer) dlsym(libcuda, "cuMemHostGetDevicePointer");
     real_cuMemPrefetchAsync = (pfn_cuMemPrefetchAsync) dlsym(libcuda, "cuMemPrefetchAsync");
 
     /* NVML — loaded separately; Ollama uses this for GPU memory discovery */
@@ -521,7 +525,7 @@ static void gb_shim_init(void)
     fprintf(stderr, "[GreenBoost] nvmlMemInfo hook  : %s\n",
             real_nvmlDeviceGetMemoryInfo ? "hooked" : "missing (NVML not found)");
     fprintf(stderr, "[GreenBoost] dlsym hook        : active (intercepts dlopen+dlsym GPU API calls)\n");
-    fprintf(stderr, "[GreenBoost] Combined VRAM     : 12 GB physical + %zu GB DDR4 via GreenBoost\n",
+    fprintf(stderr, "[GreenBoost] Combined VRAM     : physical + %zu GB DDR4 via GreenBoost\n",
             gb_virtual_vram_bytes >> 30);
 }
 
@@ -574,11 +578,12 @@ static CUresult gb_overflow_alloc(CUdeviceptr *dptr, size_t bytesize)
         /* Allocate anonymous memory using mmap, then ask greenboost.ko to pin it */
         mapped_ptr = mmap(NULL, bytesize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mapped_ptr == MAP_FAILED) {
-            fprintf(stderr, "[GreenBoost] mmap anonymous failed for %zu MB: %m\n", bytesize >> 20);
-            return CUDA_ERROR_OUT_OF_MEMORY;
+            fprintf(stderr, "[GreenBoost] mmap anonymous failed for %zu MB — falling back to UVM\n", bytesize >> 20);
+            mapped_ptr = NULL;
+            /* fall through to Path 2 (UVM) */
         }
 
-        fd = gb_open_device();
+        fd = mapped_ptr ? gb_open_device() : -1;
         if (fd >= 0) {
             struct gb_pin_req req;
             memset(&req, 0, sizeof(req));
@@ -596,28 +601,30 @@ static CUresult gb_overflow_alloc(CUdeviceptr *dptr, size_t bytesize)
                 /* Register the userspace pointer with CUDA */
                 ret = real_cuMemHostRegister(mapped_ptr, bytesize, CU_MEMHOSTREGISTER_DEVICEMAP);
                 if (ret != CUDA_SUCCESS) {
-                    fprintf(stderr, "[GreenBoost] cuMemHostRegister FAILED ret=%d for %zu MB\n",
+                    fprintf(stderr, "[GreenBoost] cuMemHostRegister FAILED ret=%d for %zu MB — falling back to UVM\n",
                             ret, bytesize >> 20);
                     munmap(mapped_ptr, bytesize);
                     close(dmabuf_fd);
-                    return CUDA_ERROR_OUT_OF_MEMORY;
+                    mapped_ptr = NULL;
+                    /* fall through to Path 2 (UVM) */
+                } else {
+                    /* Get the device pointer for the registered memory */
+                    ret = real_cuMemHostGetDevicePointer(dptr, mapped_ptr, 0);
+                    if (ret != CUDA_SUCCESS) {
+                        fprintf(stderr, "[GreenBoost] cuMemHostGetDevicePointer FAILED ret=%d — falling back to UVM\n", ret);
+                        void (*cuMemHostUnregister)(void*) = dlsym(RTLD_NEXT, "cuMemHostUnregister");
+                        if (cuMemHostUnregister) cuMemHostUnregister(mapped_ptr);
+                        munmap(mapped_ptr, bytesize);
+                        close(dmabuf_fd);
+                        mapped_ptr = NULL;
+                        /* fall through to Path 2 (UVM) */
+                    } else {
+                        ht_insert(*dptr, bytesize, 0 /* DMA-BUF */, -1, mapped_ptr, dmabuf_fd);
+                        gb_log("DMA-BUF import (pinned): %zu MB at cuda_ptr=0x%llx (mapped=%p, fd=%d)",
+                               bytesize >> 20, (unsigned long long)*dptr, mapped_ptr, dmabuf_fd);
+                        return CUDA_SUCCESS;
+                    }
                 }
-
-                /* Get the device pointer for the registered memory */
-                ret = real_cuMemHostGetDevicePointer(dptr, mapped_ptr, 0);
-                if (ret != CUDA_SUCCESS) {
-                    fprintf(stderr, "[GreenBoost] cuMemHostGetDevicePointer FAILED ret=%d\n", ret);
-                    void (*cuMemHostUnregister)(void*) = dlsym(RTLD_NEXT, "cuMemHostUnregister");
-                    if (cuMemHostUnregister) cuMemHostUnregister(mapped_ptr);
-                    munmap(mapped_ptr, bytesize);
-                    close(dmabuf_fd);
-                    return CUDA_ERROR_OUT_OF_MEMORY;
-                }
-
-                ht_insert(*dptr, bytesize, 0 /* DMA-BUF */, -1, mapped_ptr, dmabuf_fd);
-                gb_log("DMA-BUF import (pinned): %zu MB at cuda_ptr=0x%llx (mapped=%p, fd=%d)",
-                       bytesize >> 20, (unsigned long long)*dptr, mapped_ptr, dmabuf_fd);
-                return CUDA_SUCCESS;
             }
         }
     }
@@ -924,16 +931,16 @@ CUresult cuMemGetInfo(size_t *free_out, size_t *total_out)
 cudaError_t cudaMemGetInfo(size_t *free_out, size_t *total_out)
 {
     size_t real_free = 0, real_total = 0;
-    CUresult ret;
+    cudaError_t ret;
 
-    if (!initialized || !real_cuMemGetInfo)
+    if (!initialized || !real_cudaMemGetInfo)
         return (cudaError_t)CUDA_ERROR_NOT_SUPPORTED;
 
-    /* Call real driver function directly — avoids double-inflation if libcudart
-     * internally calls cuMemGetInfo_v2 (which we also override). */
-    ret = real_cuMemGetInfo(&real_free, &real_total);
+    /* Call the real runtime API — it handles CUDA context creation
+     * automatically, unlike the driver API (cuMemGetInfo_v2). */
+    ret = real_cudaMemGetInfo(&real_free, &real_total);
     if (ret != CUDA_SUCCESS)
-        return (cudaError_t)ret;
+        return ret;
 
     if (free_out)  *free_out  = real_free  + gb_virtual_vram_bytes;
     if (total_out) *total_out = real_total + gb_virtual_vram_bytes;

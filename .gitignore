@@ -23,6 +23,12 @@ nano.*.save
 .claude/
 CLAUDE.md
 
+# IDE config
+.continue/
+
+# Accidental pip output redirects
+=*
+
 # Python
 __pycache__/
 *.pyc

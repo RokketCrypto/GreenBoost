@@ -931,9 +931,9 @@ static ssize_t pool_info_show(struct device *dev,
 	return sysfs_emit(buf,
 		"=== GreenBoost v2.3 — 3-Tier Pool Info ===\n"
 		"\n"
-		"Tier 1  RTX 5070 VRAM      : %4d GB   ~336 GB/s  GDDR7 192-bit  [hot layers]\n"
-		"Tier 2  DDR4 pool cap      : %4d GB   ~57.6 GB/s dual-ch / ~32 GB/s PCIe DMA  [cold layers]\n"
-		"Tier 3  NVMe swap          : %4d GB   ~7.25 GB/s seq / ~1.8 GB/s swap  [frozen pages]\n"
+		"Tier 1  GPU VRAM           : %4d GB   [hot layers]\n"
+		"Tier 2  System RAM pool    : %4d GB   [cold layers, PCIe DMA]\n"
+		"Tier 3  NVMe swap          : %4d GB   [frozen pages]\n"
 		"        ─────────────────────────────────\n"
 		"        Combined model view: %4llu GB\n"
 		"\n"
@@ -981,47 +981,30 @@ static ssize_t hw_info_show(struct device *dev,
 			     struct device_attribute *attr, char *buf)
 {
 	return sysfs_emit(buf,
-		"=== GreenBoost v2.3 — Hardware Topology ===\n"
+		"=== GreenBoost v2.3 — Runtime Configuration ===\n"
 		"\n"
-		"CPU  i9-14900KF (Raptor Lake, LGA1700)\n"
+		"CPU\n"
 		"  Logical CPUs      : %d total\n"
-		"  P-cores (HT)      : CPU 0-%d  (8 phys × 2 HT, up to 6 GHz)\n"
-		"  Golden cores      : CPU %d-%d  (core_id 8,12 — 6 GHz TVB)\n"
-		"  E-cores           : CPU %d-end (16 phys × 1, up to 4.4 GHz)\n"
-		"  Watchdog pinned   : P-cores (CPU 0-%d) = %s\n"
-		"  L3 cache          : 36 MB shared\n"
-		"  L2 cache          : 32 MB (2 MB per P-core cluster)\n"
+		"  Watchdog pinned   : %s (CPU 0-%d)\n"
 		"\n"
-		"RAM  Crucial Ballistix DDR4-3600 (2×32 GB, dual-channel, XMP 2.0)\n"
-		"  Configuration     : 2 DIMMs, dual-channel, CL16, 1.35V\n"
-		"  Local bandwidth   : ~57.6 GB/s (2×64-bit @ 3600 MT/s)\n"
-		"  PCIe 4.0 x16 DMA  : ~32 GB/s (GPU↔DDR4 pool)\n"
+		"Memory pool\n"
+		"  T1 GPU VRAM       : %d GB\n"
+		"  T2 System RAM     : %d GB\n"
+		"  T3 NVMe swap      : %d GB\n"
+		"  Safety reserve    : %d GB\n"
 		"\n"
-		"GPU  ASUS RTX 5070 OC (GB205, 12 GB GDDR7)\n"
-		"  VRAM bandwidth    : ~336 GB/s (192-bit bus @ 14 Gbps)\n"
-		"  SM boost clock    : 2610 MHz (OC) / boost observed: 3090 MHz\n"
-		"  PCIe slot         : Gen 4 x16 (ASRock B760M-ITX/D4)\n"
-		"\n"
-		"NVMe  Samsung 990 EVO Plus 4 TB (PM9C1a, PCIe 4.0 x4 / 5.0 x2)\n"
-		"  Sequential read   : ~7,250 MB/s\n"
-		"  Sequential write  : ~6,300 MB/s\n"
-		"  Swap random I/O   : ~1.8 GB/s (T3 page-in/out)\n"
-		"\n"
-		"Motherboard  ASRock B760M-ITX/D4  (5+1+1 power phases)\n"
-		"  PCIe slots        : 1× Gen 4 x16 (GPU), 1× M.2 Gen 4 x4 (NVMe)\n"
-		"  NUMA nodes        : 1 (node 0, all CPUs)\n"
-		"\n"
-		"GreenBoost kthread affinity\n"
+		"Kthread affinity\n"
 		"  pcores_only       : %d\n"
-		"  pcores_max_cpu    : %d  (CPUs 0-%d = P-cores)\n"
+		"  pcores_max_cpu    : %d\n"
 		"  golden_cpu_min/max: %d / %d\n",
 		num_online_cpus(),
+		pcores_only ? "P-cores only" : "all CPUs",
 		pcores_max_cpu,
-		golden_cpu_min, golden_cpu_max,
-		pcores_max_cpu + 1,
-		pcores_max_cpu,
-		pcores_only ? "yes" : "no (all CPUs)",
-		pcores_only, pcores_max_cpu, pcores_max_cpu,
+		physical_vram_gb,
+		virtual_vram_gb,
+		nvme_swap_gb,
+		safety_reserve_gb,
+		pcores_only, pcores_max_cpu,
 		golden_cpu_min, golden_cpu_max);
 }
 static DEVICE_ATTR_RO(hw_info);
@@ -1144,18 +1127,16 @@ static int __init gb_init(void)
 	int ret;
 
 	pr_info(DRIVER_NAME ": =====================================================\n");
-	pr_info(DRIVER_NAME ": GreenBoost v2.3 — 3-Tier GPU Memory Pool (LRU+eventfd)\n");
-	pr_info(DRIVER_NAME ": Author  : Ferran Duarri\n");
-	pr_info(DRIVER_NAME ": CPU     : i9-14900KF — P-cores CPU 0-%d (golden %d-%d @ 6GHz)\n",
-		pcores_max_cpu, golden_cpu_min, golden_cpu_max);
-	pr_info(DRIVER_NAME ": T1 VRAM : RTX 5070 OC   %d GB  ~336 GB/s GDDR7\n",
-		physical_vram_gb);
-	pr_info(DRIVER_NAME ": T2 DDR4 : pool cap       %d GB  ~57.6 GB/s dual-ch / ~32 GB/s PCIe  (reserve %d GB)\n",
+	pr_info(DRIVER_NAME ": GreenBoost v2.3 — 3-Tier GPU Memory Pool\n");
+	pr_info(DRIVER_NAME ": T1 GPU VRAM       : %d GB\n", physical_vram_gb);
+	pr_info(DRIVER_NAME ": T2 System RAM pool: %d GB  (reserve %d GB)\n",
 		virtual_vram_gb, safety_reserve_gb);
-	pr_info(DRIVER_NAME ": T3 NVMe : 990 EVO Plus   %d GB  ~7.25 GB/s seq / ~1.8 GB/s swap  (cap %d GB)\n",
+	pr_info(DRIVER_NAME ": T3 NVMe swap      : %d GB  (cap %d GB)\n",
 		nvme_swap_gb, nvme_pool_gb);
-	pr_info(DRIVER_NAME ": Combined: %d GB total model capacity\n",
+	pr_info(DRIVER_NAME ": Combined          : %d GB\n",
 		physical_vram_gb + virtual_vram_gb + nvme_swap_gb);
+	pr_info(DRIVER_NAME ": Watchdog          : CPU 0-%d (%s)\n",
+		pcores_max_cpu, pcores_only ? "P-cores only" : "all CPUs");
 	pr_info(DRIVER_NAME ": =====================================================\n");
 
 	mutex_init(&gb_dev.lock);

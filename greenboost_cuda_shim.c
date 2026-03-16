@@ -54,6 +54,43 @@ typedef CUstream            cudaStream_t;
 #define CU_MEM_ATTACH_GLOBAL        0x1u
 #define CU_MEM_ATTACH_HOST          0x2u
 
+/* ------------------------------------------------------------------ */
+/*  CUDA VMM (Virtual Memory Management) API types                      */
+/*  Used for split allocations: VRAM + host-pinned in one VA range      */
+/* ------------------------------------------------------------------ */
+
+typedef unsigned long long CUmemGenericAllocationHandle;
+
+typedef struct {
+    int type;   /* 1=DEVICE, 2=HOST, 3=HOST_NUMA */
+    int id;     /* device ordinal or NUMA node */
+} CUmemLocation;
+
+#define CU_MEM_LOCATION_TYPE_DEVICE    1
+#define CU_MEM_LOCATION_TYPE_HOST      2
+
+typedef struct {
+    int              type;                 /* CU_MEM_ALLOCATION_TYPE_PINNED=1 */
+    int              requestedHandleTypes; /* 0 */
+    CUmemLocation    location;
+    void            *win32HandleMetaData;
+    struct {
+        unsigned char compressionType;
+        unsigned char gpuDirectRDMACapable;
+        unsigned short usage;
+        unsigned char reserved[4];
+    } allocFlags;
+} CUmemAllocationProp;
+
+typedef struct {
+    CUmemLocation location;
+    int           flags;   /* CU_MEM_ACCESS_FLAGS_PROT_READWRITE=3 */
+} CUmemAccessDesc;
+
+#define CU_MEM_ALLOCATION_TYPE_PINNED          1
+#define CU_MEM_ACCESS_FLAGS_PROT_READWRITE     3
+#define CU_MEM_ALLOC_GRANULARITY_RECOMMENDED   1
+
 /* cudaExternalMemory types (runtime API, no SDK needed) */
 typedef void *cudaExternalMemory_t;
 
@@ -148,7 +185,10 @@ typedef struct {
     int                   gb_buf_id;    /* 4 B  — -1 if not DMA-BUF      */
     void                 *mapped_ptr;   /* 8 B  — user-space mmap ptr    */
     int                   fd;           /* 4 B  — DMA-BUF fd             */
-    uint8_t               _pad[28];     /* pad to 64 bytes                */
+    int                   is_vmm;       /* 4 B  — 1 = VMM split alloc    */
+    CUmemGenericAllocationHandle vram_handle; /* 8 B — VMM GPU handle    */
+    CUmemGenericAllocationHandle host_handle; /* 8 B — VMM host handle   */
+    size_t                vram_size;    /* 8 B  — VMM VRAM portion size  */
 } __attribute__((aligned(64))) gb_ht_entry_t;
 
 static gb_ht_entry_t      gb_htable[HT_SIZE];
@@ -182,6 +222,10 @@ static int ht_insert(CUdeviceptr ptr, size_t size, int is_managed,
             e->gb_buf_id  = gb_buf_id;
             e->mapped_ptr = mapped_ptr;
             e->fd         = fd;
+            e->is_vmm     = 0;
+            e->vram_handle = 0;
+            e->host_handle = 0;
+            e->vram_size   = 0;
             pthread_mutex_unlock(lk);
             return 1;
         }
@@ -190,9 +234,49 @@ static int ht_insert(CUdeviceptr ptr, size_t size, int is_managed,
     return 0; /* table full */
 }
 
-/* Returns 1 if found, fills *out_size, *out_managed, *out_mapped_ptr, *out_fd. */
+/* VMM-aware insert for split allocations. */
+static int ht_insert_vmm(CUdeviceptr ptr, size_t size,
+                         CUmemGenericAllocationHandle vram_handle,
+                         CUmemGenericAllocationHandle host_handle,
+                         size_t vram_size)
+{
+    uint32_t h = ht_hash(ptr);
+    uint32_t i;
+    for (i = 0; i < HT_SIZE; i++) {
+        gb_ht_entry_t *e = &gb_htable[(h + i) & HT_MASK];
+        pthread_mutex_t *lk = ht_lock((h + i) & HT_MASK);
+        pthread_mutex_lock(lk);
+        if (e->ptr == 0 || e->ptr == HT_TOMBSTONE) {
+            e->ptr         = ptr;
+            e->size        = size;
+            e->is_managed  = 0;
+            e->gb_buf_id   = -1;
+            e->mapped_ptr  = NULL;
+            e->fd          = -1;
+            e->is_vmm      = 1;
+            e->vram_handle = vram_handle;
+            e->host_handle = host_handle;
+            e->vram_size   = vram_size;
+            pthread_mutex_unlock(lk);
+            return 1;
+        }
+        pthread_mutex_unlock(lk);
+    }
+    return 0;
+}
+
+/* VMM removal info — filled by ht_remove when is_vmm==1 */
+typedef struct {
+    int                          is_vmm;
+    CUmemGenericAllocationHandle vram_handle;
+    CUmemGenericAllocationHandle host_handle;
+    size_t                       vram_size;
+} gb_vmm_remove_t;
+
+/* Returns 1 if found. Fills output params (any may be NULL). */
 static int ht_remove(CUdeviceptr ptr, size_t *out_size, int *out_managed,
-                     void **out_mapped_ptr, int *out_fd)
+                     void **out_mapped_ptr, int *out_fd,
+                     gb_vmm_remove_t *out_vmm)
 {
     uint32_t h = ht_hash(ptr);
     uint32_t i;
@@ -205,12 +289,22 @@ static int ht_remove(CUdeviceptr ptr, size_t *out_size, int *out_managed,
             if (out_managed)    *out_managed    = e->is_managed;
             if (out_mapped_ptr) *out_mapped_ptr = e->mapped_ptr;
             if (out_fd)         *out_fd         = e->fd;
+            if (out_vmm) {
+                out_vmm->is_vmm      = e->is_vmm;
+                out_vmm->vram_handle = e->vram_handle;
+                out_vmm->host_handle = e->host_handle;
+                out_vmm->vram_size   = e->vram_size;
+            }
             e->ptr = HT_TOMBSTONE;
             e->size = 0;
             e->is_managed = 0;
             e->gb_buf_id = 0;
             e->mapped_ptr = NULL;
             e->fd = 0;
+            e->is_vmm = 0;
+            e->vram_handle = 0;
+            e->host_handle = 0;
+            e->vram_size = 0;
             pthread_mutex_unlock(lk);
             return 1;
         }
@@ -253,6 +347,16 @@ typedef CUresult    (*pfn_cuMemHostGetDevicePointer)(CUdeviceptr *, void *, unsi
 typedef CUresult    (*pfn_cuMemPrefetchAsync)(CUdeviceptr, size_t, CUdevice, CUstream);
 typedef cudaError_t (*pfn_cudaMemPrefetchAsync)(const void *, size_t, int, cudaStream_t);
 
+/* VMM API hooks */
+typedef CUresult (*pfn_cuMemAddressReserve)(CUdeviceptr *, size_t, size_t, CUdeviceptr, unsigned long long);
+typedef CUresult (*pfn_cuMemCreate)(CUmemGenericAllocationHandle *, size_t, const CUmemAllocationProp *, unsigned long long);
+typedef CUresult (*pfn_cuMemMap)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long);
+typedef CUresult (*pfn_cuMemSetAccess)(CUdeviceptr, size_t, const CUmemAccessDesc *, size_t);
+typedef CUresult (*pfn_cuMemUnmap)(CUdeviceptr, size_t);
+typedef CUresult (*pfn_cuMemRelease)(CUmemGenericAllocationHandle);
+typedef CUresult (*pfn_cuMemAddressFree)(CUdeviceptr, size_t);
+typedef CUresult (*pfn_cuMemGetAllocationGranularity)(size_t *, const CUmemAllocationProp *, int);
+
 /* NVML types (minimal — avoids libnvidia-ml dependency) */
 typedef void *nvmlDevice_t;
 typedef unsigned int nvmlReturn_t;
@@ -289,7 +393,18 @@ static pfn_cuMemHostGetDevicePointer       real_cuMemHostGetDevicePointer;
 static pfn_cuMemPrefetchAsync              real_cuMemPrefetchAsync;
 static pfn_cudaMemPrefetchAsync            real_cudaMemPrefetchAsync;
 
-static size_t vram_headroom_bytes   = 2048ULL * 1024 * 1024; /* 2 GB */
+/* VMM function pointers */
+static pfn_cuMemAddressReserve             real_cuMemAddressReserve;
+static pfn_cuMemCreate                     real_cuMemCreate;
+static pfn_cuMemMap                        real_cuMemMap;
+static pfn_cuMemSetAccess                  real_cuMemSetAccess;
+static pfn_cuMemUnmap                      real_cuMemUnmap;
+static pfn_cuMemRelease                    real_cuMemRelease;
+static pfn_cuMemAddressFree                real_cuMemAddressFree;
+static pfn_cuMemGetAllocationGranularity   real_cuMemGetAllocationGranularity;
+static int                                 gb_vmm_available = 0;
+
+static size_t vram_headroom_bytes   = 1400ULL * 1024 * 1024; /* 1.4 GB — leaves room for KV cache + compute */
 static size_t gb_virtual_vram_bytes = 51ULL * 1024 * 1024 * 1024; /* DDR4 pool — reported to CUDA */
 /* DMA-BUF mmap+register is the primary path now. */
 static int    gb_use_dmabuf         = 1;
@@ -461,6 +576,21 @@ static void gb_shim_init(void)
         real_cuMemHostGetDevicePointer = (pfn_cuMemHostGetDevicePointer) dlsym(libcuda, "cuMemHostGetDevicePointer");
     real_cuMemPrefetchAsync = (pfn_cuMemPrefetchAsync) dlsym(libcuda, "cuMemPrefetchAsync");
 
+    /* VMM API — for split allocations (VRAM + host in one VA range) */
+    real_cuMemAddressReserve           = (pfn_cuMemAddressReserve)           dlsym(libcuda, "cuMemAddressReserve");
+    real_cuMemCreate                   = (pfn_cuMemCreate)                   dlsym(libcuda, "cuMemCreate");
+    real_cuMemMap                      = (pfn_cuMemMap)                      dlsym(libcuda, "cuMemMap");
+    real_cuMemSetAccess                = (pfn_cuMemSetAccess)                dlsym(libcuda, "cuMemSetAccess");
+    real_cuMemUnmap                    = (pfn_cuMemUnmap)                    dlsym(libcuda, "cuMemUnmap");
+    real_cuMemRelease                  = (pfn_cuMemRelease)                  dlsym(libcuda, "cuMemRelease");
+    real_cuMemAddressFree              = (pfn_cuMemAddressFree)              dlsym(libcuda, "cuMemAddressFree");
+    real_cuMemGetAllocationGranularity = (pfn_cuMemGetAllocationGranularity) dlsym(libcuda, "cuMemGetAllocationGranularity");
+
+    gb_vmm_available = (real_cuMemAddressReserve && real_cuMemCreate &&
+                        real_cuMemMap && real_cuMemSetAccess &&
+                        real_cuMemUnmap && real_cuMemRelease &&
+                        real_cuMemAddressFree && real_cuMemGetAllocationGranularity);
+
     /* NVML — loaded separately; Ollama uses this for GPU memory discovery */
     {
         void *libnvml = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_GLOBAL);
@@ -524,6 +654,9 @@ static void gb_shim_init(void)
             real_cuDeviceTotalMem_v2 ? "hooked" : "missing");
     fprintf(stderr, "[GreenBoost] nvmlMemInfo hook  : %s\n",
             real_nvmlDeviceGetMemoryInfo ? "hooked" : "missing (NVML not found)");
+    fprintf(stderr, "[GreenBoost] VMM split alloc   : %s\n",
+            gb_vmm_available ? "available (VRAM + host-pinned in one VA range)"
+            : "unavailable (driver too old or missing VMM symbols)");
     fprintf(stderr, "[GreenBoost] dlsym hook        : active (intercepts dlopen+dlsym GPU API calls)\n");
     fprintf(stderr, "[GreenBoost] Combined VRAM     : physical + %zu GB DDR4 via GreenBoost\n",
             gb_virtual_vram_bytes >> 30);
@@ -557,14 +690,205 @@ static int gb_needs_overflow(size_t bytesize)
     if (real_cuMemGetInfo(&free_vram, &total_vram) != CUDA_SUCCESS)
         return 0;
 
-    if (bytesize + vram_headroom_bytes > free_vram) {
-        gb_log("VRAM: req=%zuMB free=%zuMB headroom=%zuMB → OVERFLOW to DDR4",
-               bytesize >> 20, free_vram >> 20, vram_headroom_bytes >> 20);
+    /* Simple check: does this allocation fit in free VRAM?
+     * Headroom is only used by VMM split to decide how much VRAM
+     * to reserve for model weights. For subsequent allocations
+     * (KV cache, compute), just let them use whatever VRAM remains. */
+    if (bytesize > free_vram) {
+        gb_log("VRAM: req=%zuMB free=%zuMB → OVERFLOW to DDR4",
+               bytesize >> 20, free_vram >> 20);
         return 1;
     }
     gb_log("VRAM: req=%zuMB free=%zuMB → fits", bytesize >> 20, free_vram >> 20);
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/*  VMM split allocation: VRAM + host-pinned in one contiguous VA      */
+/* ------------------------------------------------------------------ */
+
+static inline size_t align_up(size_t val, size_t align)
+{
+    return (val + align - 1) & ~(align - 1);
+}
+
+static CUresult gb_vmm_split_alloc(CUdeviceptr *dptr, size_t bytesize)
+{
+    CUmemAllocationProp prop_gpu, prop_host;
+    CUmemAccessDesc access_desc;
+    CUmemGenericAllocationHandle vram_handle = 0, host_handle = 0;
+    CUdeviceptr va_base = 0;
+    size_t gran_gpu = 0, gran_host = 0, gran_max;
+    size_t free_vram = 0, total_vram = 0;
+    size_t vram_size, host_size, total_aligned;
+    CUresult ret;
+
+    if (!gb_vmm_available)
+        return CUDA_ERROR_NOT_SUPPORTED;
+
+    /* 1. Query GPU allocation granularity */
+    memset(&prop_gpu, 0, sizeof(prop_gpu));
+    prop_gpu.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop_gpu.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop_gpu.location.id = 0;
+
+    ret = real_cuMemGetAllocationGranularity(&gran_gpu, &prop_gpu,
+                                             CU_MEM_ALLOC_GRANULARITY_RECOMMENDED);
+    if (ret != CUDA_SUCCESS || gran_gpu == 0) {
+        gb_log("VMM: cuMemGetAllocationGranularity(GPU) failed ret=%d", ret);
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+
+    /* 2. Query host allocation granularity */
+    memset(&prop_host, 0, sizeof(prop_host));
+    prop_host.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop_host.location.type = CU_MEM_LOCATION_TYPE_HOST;
+    prop_host.location.id = 0;  /* default NUMA node */
+
+    ret = real_cuMemGetAllocationGranularity(&gran_host, &prop_host,
+                                             CU_MEM_ALLOC_GRANULARITY_RECOMMENDED);
+    if (ret != CUDA_SUCCESS || gran_host == 0) {
+        gb_log("VMM: cuMemGetAllocationGranularity(HOST) failed ret=%d — host VMM not supported", ret);
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+
+    gran_max = gran_gpu > gran_host ? gran_gpu : gran_host;
+
+    /* 3. Compute split point */
+    if (real_cuMemGetInfo(&free_vram, &total_vram) != CUDA_SUCCESS)
+        return CUDA_ERROR_NOT_SUPPORTED;
+
+    if (free_vram > vram_headroom_bytes)
+        vram_size = free_vram - vram_headroom_bytes;
+    else
+        vram_size = 0;
+
+    /* Align VRAM portion down to granularity */
+    vram_size = (vram_size / gran_gpu) * gran_gpu;
+
+    if (vram_size >= bytesize) {
+        /* Everything fits in VRAM — shouldn't be here, but handle it */
+        vram_size = align_up(bytesize, gran_gpu);
+        host_size = 0;
+    } else {
+        host_size = align_up(bytesize - vram_size, gran_host);
+    }
+
+    total_aligned = vram_size + host_size;
+
+    gb_log("VMM split: total=%zuMB vram=%zuMB host=%zuMB gran_gpu=%zuKB gran_host=%zuKB",
+           bytesize >> 20, vram_size >> 20, host_size >> 20,
+           gran_gpu >> 10, gran_host >> 10);
+
+    /* 4. Reserve contiguous virtual address range */
+    ret = real_cuMemAddressReserve(&va_base, total_aligned, gran_max, 0, 0);
+    if (ret != CUDA_SUCCESS) {
+        fprintf(stderr, "[GreenBoost] VMM: cuMemAddressReserve(%zu MB) failed ret=%d\n",
+                total_aligned >> 20, ret);
+        return ret;
+    }
+
+    /* 5. Create GPU physical allocation (if any VRAM portion) */
+    if (vram_size > 0) {
+        ret = real_cuMemCreate(&vram_handle, vram_size, &prop_gpu, 0);
+        if (ret != CUDA_SUCCESS) {
+            fprintf(stderr, "[GreenBoost] VMM: cuMemCreate(GPU, %zu MB) failed ret=%d — reducing to host-only\n",
+                    vram_size >> 20, ret);
+            /* Free old VA range with its original size */
+            real_cuMemAddressFree(va_base, total_aligned);
+            /* Fall back: all host */
+            vram_size = 0;
+            host_size = align_up(bytesize, gran_host);
+            total_aligned = host_size;
+            ret = real_cuMemAddressReserve(&va_base, total_aligned, gran_max, 0, 0);
+            if (ret != CUDA_SUCCESS) {
+                fprintf(stderr, "[GreenBoost] VMM: cuMemAddressReserve retry failed ret=%d\n", ret);
+                return ret;
+            }
+        }
+    }
+
+    /* 6. Create host physical allocation */
+    if (host_size > 0) {
+        ret = real_cuMemCreate(&host_handle, host_size, &prop_host, 0);
+        if (ret != CUDA_SUCCESS) {
+            fprintf(stderr, "[GreenBoost] VMM: cuMemCreate(HOST, %zu MB) failed ret=%d\n",
+                    host_size >> 20, ret);
+            goto fail_after_vram;
+        }
+    }
+
+    /* 7. Map VRAM into first portion of VA range */
+    if (vram_size > 0) {
+        ret = real_cuMemMap(va_base, vram_size, 0, vram_handle, 0);
+        if (ret != CUDA_SUCCESS) {
+            fprintf(stderr, "[GreenBoost] VMM: cuMemMap(VRAM, %zu MB) failed ret=%d\n",
+                    vram_size >> 20, ret);
+            goto fail_after_host;
+        }
+    }
+
+    /* 8. Map host into second portion */
+    if (host_size > 0) {
+        ret = real_cuMemMap(va_base + vram_size, host_size, 0, host_handle, 0);
+        if (ret != CUDA_SUCCESS) {
+            fprintf(stderr, "[GreenBoost] VMM: cuMemMap(HOST, %zu MB) failed ret=%d\n",
+                    host_size >> 20, ret);
+            if (vram_size > 0) real_cuMemUnmap(va_base, vram_size);
+            goto fail_after_host;
+        }
+    }
+
+    /* 9. Set read/write access for GPU */
+    memset(&access_desc, 0, sizeof(access_desc));
+    access_desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access_desc.location.id = 0;
+    access_desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+
+    ret = real_cuMemSetAccess(va_base, total_aligned, &access_desc, 1);
+    if (ret != CUDA_SUCCESS) {
+        fprintf(stderr, "[GreenBoost] VMM: cuMemSetAccess failed ret=%d\n", ret);
+        real_cuMemUnmap(va_base, total_aligned);
+        goto fail_after_host;
+    }
+
+    /* 10. Register in hash table */
+    ht_insert_vmm(va_base, total_aligned, vram_handle, host_handle, vram_size);
+
+    *dptr = va_base;
+    gb_log("VMM split SUCCESS: %zu MB at 0x%llx (VRAM=%zuMB + HOST=%zuMB)",
+           total_aligned >> 20, (unsigned long long)va_base,
+           vram_size >> 20, host_size >> 20);
+    return CUDA_SUCCESS;
+
+fail_after_host:
+    if (host_handle) real_cuMemRelease(host_handle);
+fail_after_vram:
+    if (vram_handle) real_cuMemRelease(vram_handle);
+    real_cuMemAddressFree(va_base, total_aligned);
+    return CUDA_ERROR_OUT_OF_MEMORY;
+}
+
+/* Free a VMM split allocation. */
+static void gb_vmm_free(CUdeviceptr dptr, size_t total_size,
+                        const gb_vmm_remove_t *vmm)
+{
+    if (vmm->vram_size > 0)
+        real_cuMemUnmap(dptr, vmm->vram_size);
+    if (total_size > vmm->vram_size)
+        real_cuMemUnmap(dptr + vmm->vram_size, total_size - vmm->vram_size);
+    if (vmm->vram_handle)
+        real_cuMemRelease(vmm->vram_handle);
+    if (vmm->host_handle)
+        real_cuMemRelease(vmm->host_handle);
+    real_cuMemAddressFree(dptr, total_size);
+    gb_log("VMM free: 0x%llx %zu MB (vram=%zu MB)",
+           (unsigned long long)dptr, total_size >> 20, vmm->vram_size >> 20);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Overflow allocation (DMA-BUF → UVM fallback chain)                 */
+/* ------------------------------------------------------------------ */
 
 /* Try UVM first (safe, no context corruption), DMA-BUF second (disabled by default) */
 static CUresult gb_overflow_alloc(CUdeviceptr *dptr, size_t bytesize)
@@ -572,6 +896,14 @@ static CUresult gb_overflow_alloc(CUdeviceptr *dptr, size_t bytesize)
     void *mapped_ptr = NULL;
     int fd = -1;
     CUresult ret;
+
+    /* ---- Path 0: VMM split (VRAM + host-pinned) ---- */
+    if (gb_vmm_available) {
+        ret = gb_vmm_split_alloc(dptr, bytesize);
+        if (ret == CUDA_SUCCESS)
+            return CUDA_SUCCESS;
+        gb_log("VMM split failed (ret=%d), falling back to DMA-BUF/UVM", ret);
+    }
 
     /* ---- Path 1: DMA-BUF (primary path now) -------------------------- */
     if (gb_use_dmabuf && real_cuMemHostRegister) {
@@ -686,11 +1018,16 @@ CUresult cuMemFree_v2(CUdeviceptr dptr)
     int fd = -1;
     size_t sz = 0;
     int managed = 0;
+    gb_vmm_remove_t vmm = {0};
 
     if (!initialized || !real_cuMemFree_v2)
         return CUDA_SUCCESS;
 
-    if (ht_remove(dptr, &sz, &managed, &mapped_ptr, &fd)) {
+    if (ht_remove(dptr, &sz, &managed, &mapped_ptr, &fd, &vmm)) {
+        if (vmm.is_vmm) {
+            gb_vmm_free(dptr, sz, &vmm);
+            return CUDA_SUCCESS; /* VMM ptr — do NOT call real_cuMemFree */
+        }
         gb_log("cuMemFree_v2 ptr=0x%llx size=%zu MB managed=%d mapped_ptr=%p fd=%d",
                (unsigned long long)dptr, sz >> 20, managed, mapped_ptr, fd);
         if (mapped_ptr) {
@@ -811,6 +1148,7 @@ cudaError_t cudaFree(void *devPtr)
     int fd = -1;
     size_t sz = 0;
     int managed = 0;
+    gb_vmm_remove_t vmm = {0};
     CUdeviceptr dptr = (CUdeviceptr)(uintptr_t)devPtr;
 
     if (!initialized)
@@ -821,7 +1159,11 @@ cudaError_t cudaFree(void *devPtr)
     if (!real_cudaFree)
         return CUDA_SUCCESS;
 
-    if (ht_remove(dptr, &sz, &managed, &mapped_ptr, &fd)) {
+    if (ht_remove(dptr, &sz, &managed, &mapped_ptr, &fd, &vmm)) {
+        if (vmm.is_vmm) {
+            gb_vmm_free(dptr, sz, &vmm);
+            return CUDA_SUCCESS; /* VMM ptr — do NOT call real_cudaFree */
+        }
         gb_log("cudaFree ptr=0x%llx size=%zu MB managed=%d mapped_ptr=%p fd=%d",
                (unsigned long long)dptr, sz >> 20, managed, mapped_ptr, fd);
         if (mapped_ptr) {
@@ -851,7 +1193,7 @@ CUresult cuMemPrefetchAsync(CUdeviceptr dptr, size_t count, CUdevice dstDevice, 
         return CUDA_SUCCESS;
 
     /* Check if this is a GreenBoost DMA-BUF allocation */
-    if (ht_remove(dptr, &sz, &managed, &mapped_ptr, &fd)) {
+    if (ht_remove(dptr, &sz, &managed, &mapped_ptr, &fd, NULL)) {
         if (mapped_ptr) {
             enqueue_prefetch(mapped_ptr, count < sz ? count : sz);
         }
@@ -880,7 +1222,7 @@ cudaError_t cudaMemPrefetchAsync(const void *devPtr, size_t count, int dstDevice
         real_cudaMemPrefetchAsync = (pfn_cudaMemPrefetchAsync)dlsym(RTLD_NEXT, "cudaMemPrefetchAsync");
     }
 
-    if (ht_remove(dptr, &sz, &managed, &mapped_ptr, &fd)) {
+    if (ht_remove(dptr, &sz, &managed, &mapped_ptr, &fd, NULL)) {
         if (mapped_ptr) {
             enqueue_prefetch(mapped_ptr, count < sz ? count : sz);
         }
